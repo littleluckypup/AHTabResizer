@@ -8,6 +8,9 @@ local DEFAULTS = {
     hideButton = false, -- Hide the 'Tab Size' button on the AH title bar
 }
 
+local BUTTON_WIDTH = 74
+local BUTTON_HEIGHT = 22
+
 local IsSecret = issecretvalue or function()
     return false
 end
@@ -16,8 +19,11 @@ local isApplying = false
 local isLibHooked = false
 local isGlobalHooked = false
 local isRefreshingUI = false
+local isResettingButton = false
+local pendingAHRefresh = false
 local hookedFrames = {}
 local ahButtons = {}
+local isOwnFrame = {}
 local knownTabs = {}
 local cachedTabs = {}
 
@@ -25,6 +31,8 @@ local floatingFrame = nil
 local uiControls = {}
 
 local UpdateAHButtonVisibility
+local EnsureAHHeaderButton
+local ApplyAllTabs
 
 local function InitDB()
     if type(AHTabResizerDB) ~= "table" then
@@ -88,13 +96,33 @@ local function GetActiveAHFrame()
     return nil, nil
 end
 
-local function IsAHShown()
-    local ahFrame = GetActiveAHFrame()
-    if not ahFrame then
+local function IsAHFrameReady(ahFrame)
+    if not IsSafeFrame(ahFrame) then
         return false
     end
-    local ok, shown = pcall(ahFrame.IsShown, ahFrame)
-    return ok and not IsSecret(shown) and shown == true
+    local okVis, vis = pcall(ahFrame.IsVisible, ahFrame)
+    if not okVis or IsSecret(vis) or not vis then
+        return false
+    end
+    local alpha = SafeNumber(ahFrame.GetAlpha and ahFrame:GetAlpha())
+    if alpha and alpha < 0.05 then
+        return false
+    end
+    local scale = SafeNumber(ahFrame.GetEffectiveScale and ahFrame:GetEffectiveScale())
+    if not scale or scale < 0.1 then
+        return false
+    end
+    local w = SafeNumber(ahFrame.GetWidth and ahFrame:GetWidth())
+    local h = SafeNumber(ahFrame.GetHeight and ahFrame:GetHeight())
+    if not w or not h or (w * scale) < 200 or (h * scale) < 150 then
+        return false
+    end
+    return true
+end
+
+local function IsAHShown()
+    local ahFrame = GetActiveAHFrame()
+    return IsAHFrameReady(ahFrame)
 end
 
 local function IsButton(f)
@@ -109,12 +137,12 @@ end
 
 local function HasTabTraits(frame)
     local ok, res = pcall(function()
-        if not IsButton(frame) then
+        if not IsButton(frame) or isOwnFrame[frame] then
             return false
         end
         if frame.LeftActive or frame.MiddleActive or frame.RightActive
             or frame.LeftDisabled or frame.MiddleDisabled or frame.RightDisabled
-            or frame.tabID or (frame.Left and frame.Middle and frame.Right) then
+            or frame.tabID then
             return true
         end
         local name = SafeString(frame.GetName and frame:GetName())
@@ -128,7 +156,7 @@ end
 
 local function IsInBottomTabRow(frame, ahBottomPx, ahLeftPx, ahRightPx)
     local ok, res = pcall(function()
-        if not IsSafeFrame(frame) or not frame.IsVisible then
+        if not IsSafeFrame(frame) or isOwnFrame[frame] or not frame.IsVisible then
             return false
         end
         local visible = frame:IsVisible()
@@ -162,9 +190,7 @@ end
 
 local function CollectTabs()
     local ahFrame, tabPrefix = GetActiveAHFrame()
-    if not ahFrame then
-        cachedTabs = {}
-        knownTabs = {}
+    if not IsAHFrameReady(ahFrame) then
         return {}
     end
 
@@ -172,10 +198,18 @@ local function CollectTabs()
     local seen = {}
 
     local function AddTab(tab)
-        if IsButton(tab) and not seen[tab] then
-            seen[tab] = true
-            table.insert(tabs, tab)
+        if not IsButton(tab) or seen[tab] or isOwnFrame[tab] then
+            return
         end
+        if tab == ahFrame.CloseButton then
+            return
+        end
+        local parent = tab.GetParent and tab:GetParent()
+        if IsSafeFrame(parent) and (isOwnFrame[parent] or parent == ahFrame.TitleContainer) then
+            return
+        end
+        seen[tab] = true
+        table.insert(tabs, tab)
     end
 
     -- 1. Blizzard default tabs (Retail/Forever and Classic)
@@ -228,62 +262,62 @@ local function CollectTabs()
     local ahLeftPx = hasBounds and (ahLeft * ahScale) or nil
     local ahRightPx = hasBounds and (ahRight * ahScale) or nil
 
-    -- 3. Recursively scan AH frame children
-    local function ScanDescendants(parent, depth)
-        if depth > 4 or not IsSafeFrame(parent) or not parent.GetChildren then
-            return
-        end
-        local okKids, kids = pcall(function()
-            return { parent:GetChildren() }
-        end)
-        if not okKids or type(kids) ~= "table" then
-            return
-        end
-        for _, child in ipairs(kids) do
-            if IsSafeFrame(child) then
-                if HasTabTraits(child) then
-                    if not hasBounds or IsInBottomTabRow(child, ahBottomPx, ahLeftPx, ahRightPx) then
+    -- 3. Recursively scan AH frame children (only along the bottom tab row)
+    if hasBounds then
+        local function ScanDescendants(parent, depth)
+            if depth > 4 or not IsSafeFrame(parent) or isOwnFrame[parent] or not parent.GetChildren then
+                return
+            end
+            local okKids, kids = pcall(function()
+                return { parent:GetChildren() }
+            end)
+            if not okKids or type(kids) ~= "table" then
+                return
+            end
+            for _, child in ipairs(kids) do
+                if IsSafeFrame(child) and not isOwnFrame[child] then
+                    if HasTabTraits(child) and IsInBottomTabRow(child, ahBottomPx, ahLeftPx, ahRightPx) then
                         AddTab(child)
                     end
+                    ScanDescendants(child, depth + 1)
                 end
-                ScanDescendants(child, depth + 1)
             end
         end
-    end
-    ScanDescendants(ahFrame, 1)
+        ScanDescendants(ahFrame, 1)
 
-    -- 4. Sandboxed fallback scan for UIParent-parented addon tabs
-    if hasBounds and EnumerateFrames then
-        local visibleRowButtons = {}
-        local f = EnumerateFrames()
-        while f do
-            pcall(function()
-                if IsButton(f) and IsInBottomTabRow(f, ahBottomPx, ahLeftPx, ahRightPx) then
-                    table.insert(visibleRowButtons, f)
-                    if HasTabTraits(f) then
-                        AddTab(f)
-                    end
-                end
-            end)
-            f = EnumerateFrames(f)
-        end
-
-        local foundNew = true
-        while foundNew do
-            foundNew = false
-            for _, btn in ipairs(visibleRowButtons) do
-                if not seen[btn] then
-                    pcall(function()
-                        local numPoints = SafeNumber(btn.GetNumPoints and btn:GetNumPoints()) or 0
-                        for i = 1, numPoints do
-                            local _, relativeTo = btn:GetPoint(i)
-                            if IsSafeFrame(relativeTo) and (seen[relativeTo] or relativeTo == ahFrame) then
-                                AddTab(btn)
-                                foundNew = true
-                                break
-                            end
+        -- 4. Sandboxed fallback scan for UIParent-parented addon tabs
+        if EnumerateFrames then
+            local visibleRowButtons = {}
+            local f = EnumerateFrames()
+            while f do
+                pcall(function()
+                    if not isOwnFrame[f] and IsButton(f) and IsInBottomTabRow(f, ahBottomPx, ahLeftPx, ahRightPx) then
+                        table.insert(visibleRowButtons, f)
+                        if HasTabTraits(f) then
+                            AddTab(f)
                         end
-                    end)
+                    end
+                end)
+                f = EnumerateFrames(f)
+            end
+
+            local foundNew = true
+            while foundNew do
+                foundNew = false
+                for _, btn in ipairs(visibleRowButtons) do
+                    if not seen[btn] then
+                        pcall(function()
+                            local numPoints = SafeNumber(btn.GetNumPoints and btn:GetNumPoints()) or 0
+                            for i = 1, numPoints do
+                                local _, relativeTo = btn:GetPoint(i)
+                                if IsSafeFrame(relativeTo) and (seen[relativeTo] or relativeTo == ahFrame) then
+                                    AddTab(btn)
+                                    foundNew = true
+                                    break
+                                end
+                            end
+                        end)
+                    end
                 end
             end
         end
@@ -295,7 +329,7 @@ local function CollectTabs()
 end
 
 local function ApplyToTab(tab)
-    if not IsSafeFrame(tab) or not AHTabResizerDB then
+    if not IsSafeFrame(tab) or isOwnFrame[tab] or not AHTabResizerDB then
         return
     end
 
@@ -330,9 +364,9 @@ local function ApplyToTab(tab)
     end
 end
 
-local function ApplyAllTabs(useCache)
+ApplyAllTabs = function(useCache)
     local ahFrame = GetActiveAHFrame()
-    if isApplying or not ahFrame then
+    if isApplying or not IsAHFrameReady(ahFrame) then
         return
     end
 
@@ -362,14 +396,19 @@ local function PrintDebugInfo()
         return
     end
     local ahName = SafeString(ahFrame.GetName and ahFrame:GetName()) or "Unknown"
-    local okShown, isShown = pcall(ahFrame.IsShown, ahFrame)
+    local isReady = IsAHFrameReady(ahFrame)
     local okLib, lib = pcall(function()
         return LibStub and LibStub("LibAHTab-1-0", true)
     end)
-    print(string.format("  Frame=%s, shown=%s, LibAHTab=%s",
+    print(string.format("  Frame=%s, ready=%s, LibAHTab=%s",
         ahName,
-        tostring(okShown and isShown or false),
+        tostring(isReady),
         tostring(okLib and lib ~= nil)))
+
+    if not isReady then
+        print("  Auction House frame is currently hidden or replaced (e.g. TSM UI is active).")
+        return
+    end
 
     local okTabs, tabs = pcall(CollectTabs)
     if not okTabs then
@@ -530,6 +569,7 @@ local function GetOrCreateFloatingWindow()
 
     local template = BackdropTemplateMixin and "BackdropTemplate" or nil
     local f = CreateFrame("Frame", "AHTabResizerFloatingFrame", UIParent, template)
+    isOwnFrame[f] = true
     f:SetSize(306, 376)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 90)
     f:SetFrameStrata("DIALOG")
@@ -565,6 +605,7 @@ local function GetOrCreateFloatingWindow()
     sub:SetText("Drag to move • Scroll to fine-tune (Shift = 5x)")
 
     local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    isOwnFrame[closeBtn] = true
     closeBtn:SetPoint("TOPRIGHT", -4, -4)
 
     -- 1. Scale Slider (0.01x fine steps, 0.05x with Shift+Scroll)
@@ -588,6 +629,7 @@ local function GetOrCreateFloatingWindow()
 
     -- 2. Fixed Width Checkbox
     local fixedCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    isOwnFrame[fixedCheck] = true
     fixedCheck:SetPoint("TOPLEFT", scaleSlider.container, "BOTTOMLEFT", -4, -12)
 
     local fixedCheckLabel = fixedCheck:CreateFontString(nil, "ARTWORK", "GameFontNormal")
@@ -648,6 +690,7 @@ local function GetOrCreateFloatingWindow()
 
     -- 5. Hide AH Header Button Checkbox
     local hideButtonCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    isOwnFrame[hideButtonCheck] = true
     hideButtonCheck:SetPoint("TOPLEFT", paddingSlider.container, "BOTTOMLEFT", -4, -10)
 
     local hideButtonLabel = hideButtonCheck:CreateFontString(nil, "ARTWORK", "GameFontNormal")
@@ -666,6 +709,7 @@ local function GetOrCreateFloatingWindow()
 
     -- Action Buttons
     local resetBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    isOwnFrame[resetBtn] = true
     resetBtn:SetSize(124, 24)
     resetBtn:SetPoint("TOPLEFT", hideButtonCheck, "BOTTOMLEFT", 4, -12)
     resetBtn:SetText("Reset Defaults")
@@ -682,6 +726,7 @@ local function GetOrCreateFloatingWindow()
     end)
 
     local rescanBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    isOwnFrame[rescanBtn] = true
     rescanBtn:SetSize(136, 24)
     rescanBtn:SetPoint("LEFT", resetBtn, "RIGHT", 10, 0)
     rescanBtn:SetText("Rescan & Debug")
@@ -736,7 +781,37 @@ local function UpdateAHButtonLayer(ahFrame, btn)
     pcall(btn.SetFrameLevel, btn, targetLevel)
 end
 
-local function EnsureAHHeaderButton(ahFrame)
+local function ResetAHHeaderButton(ahFrame, btn)
+    if isResettingButton or not IsSafeFrame(ahFrame) or not IsSafeFrame(btn) then
+        return
+    end
+    isResettingButton = true
+    pcall(function()
+        btn:SetScale(1.0)
+        btn:ClearAllPoints()
+        btn:SetSize(BUTTON_WIDTH, BUTTON_HEIGHT)
+
+        local ahName = SafeString(ahFrame.GetName and ahFrame:GetName()) or ""
+        local closeBtn = ahFrame.CloseButton or (ahName ~= "" and _G[ahName .. "CloseButton"])
+        local closeW = IsSafeFrame(closeBtn) and SafeNumber(closeBtn.GetWidth and closeBtn:GetWidth())
+        if IsSafeFrame(closeBtn) and closeW and closeW > 0 and closeW <= 60 then
+            btn:SetPoint("RIGHT", closeBtn, "LEFT", -4, 0)
+        else
+            btn:SetPoint("TOPRIGHT", ahFrame, "TOPRIGHT", -34, -2)
+        end
+
+        -- Keep 3-slice textures pinned to the button edges
+        if btn.Middle and btn.Left and btn.Right then
+            btn.Middle:ClearAllPoints()
+            btn.Middle:SetPoint("TOPLEFT", btn.Left, "TOPRIGHT")
+            btn.Middle:SetPoint("BOTTOMRIGHT", btn.Right, "BOTTOMLEFT")
+        end
+    end)
+    UpdateAHButtonLayer(ahFrame, btn)
+    isResettingButton = false
+end
+
+EnsureAHHeaderButton = function(ahFrame)
     if not IsSafeFrame(ahFrame) then
         return
     end
@@ -744,7 +819,7 @@ local function EnsureAHHeaderButton(ahFrame)
     local shouldHide = AHTabResizerDB and AHTabResizerDB.hideButton == true
     local existing = ahButtons[ahFrame]
     if existing then
-        UpdateAHButtonLayer(ahFrame, existing)
+        ResetAHHeaderButton(ahFrame, existing)
         if shouldHide then
             existing:Hide()
         else
@@ -757,19 +832,27 @@ local function EnsureAHHeaderButton(ahFrame)
         return
     end
 
-    local btn = CreateFrame("Button", "AHTabResizerHeaderButton", ahFrame, "UIPanelButtonTemplate")
-    btn:SetSize(74, 22)
+    -- Unnamed button so no tab scanner (ours or third-party) matches "tab" in its name
+    local btn = CreateFrame("Button", nil, ahFrame, "UIPanelButtonTemplate")
+    isOwnFrame[btn] = true
     btn:SetText("Tab Size")
 
-    local ahName = SafeString(ahFrame.GetName and ahFrame:GetName()) or ""
-    local closeBtn = ahFrame.CloseButton or (ahName ~= "" and _G[ahName .. "CloseButton"])
-    if IsSafeFrame(closeBtn) then
-        btn:SetPoint("RIGHT", closeBtn, "LEFT", -4, 0)
-    else
-        btn:SetPoint("TOPRIGHT", ahFrame, "TOPRIGHT", -34, -2)
-    end
+    ResetAHHeaderButton(ahFrame, btn)
 
-    UpdateAHButtonLayer(ahFrame, btn)
+    btn:HookScript("OnShow", function(self)
+        ResetAHHeaderButton(ahFrame, self)
+    end)
+    btn:HookScript("OnSizeChanged", function(self, w, h)
+        if isResettingButton then
+            return
+        end
+        local nw = SafeNumber(w) or 0
+        local nh = SafeNumber(h) or 0
+        local numPts = SafeNumber(self:GetNumPoints()) or 0
+        if math.abs(nw - BUTTON_WIDTH) > 2 or math.abs(nh - BUTTON_HEIGHT) > 2 or numPts ~= 1 then
+            ResetAHHeaderButton(ahFrame, self)
+        end
+    end)
 
     btn:SetScript("OnClick", function()
         ToggleFloatingWindow()
@@ -792,11 +875,12 @@ UpdateAHButtonVisibility = function()
     local ahFrame = GetActiveAHFrame()
     local shouldHide = AHTabResizerDB and AHTabResizerDB.hideButton == true
 
-    for _, btn in pairs(ahButtons) do
+    for frame, btn in pairs(ahButtons) do
         if IsSafeFrame(btn) then
             if shouldHide then
                 btn:Hide()
             else
+                ResetAHHeaderButton(frame, btn)
                 btn:Show()
             end
         end
@@ -811,15 +895,38 @@ end
 -- Hooks, Events & Slash Commands
 -- ============================================================================
 
+local function QueueAHRefresh()
+    if pendingAHRefresh then
+        return
+    end
+    pendingAHRefresh = true
+    C_Timer.After(0, function()
+        pendingAHRefresh = false
+        local ahFrame = GetActiveAHFrame()
+        if ahFrame and IsAHFrameReady(ahFrame) then
+            EnsureAHHeaderButton(ahFrame)
+            ApplyAllTabs(false)
+        end
+    end)
+end
+
 local function ScheduleApply()
     C_Timer.After(0, function()
         local ahFrame = GetActiveAHFrame()
         if ahFrame then
             EnsureAHHeaderButton(ahFrame)
+            if IsAHFrameReady(ahFrame) then
+                ApplyAllTabs(false)
+            end
         end
-        ApplyAllTabs(false)
     end)
-    C_Timer.After(0.2, function() ApplyAllTabs(false) end)
+    C_Timer.After(0.2, function()
+        local ahFrame = GetActiveAHFrame()
+        if ahFrame and IsAHFrameReady(ahFrame) then
+            EnsureAHHeaderButton(ahFrame)
+            ApplyAllTabs(false)
+        end
+    end)
 end
 
 local function HookLibAHTab()
@@ -848,11 +955,16 @@ local function SetupHooks()
         if not hookedFrames[ahFrame] then
             hookedFrames[ahFrame] = true
             ahFrame:HookScript("OnShow", ScheduleApply)
+            ahFrame:HookScript("OnSizeChanged", QueueAHRefresh)
             ahFrame:HookScript("OnHide", function()
                 if floatingFrame and floatingFrame:IsShown() then
                     floatingFrame:Hide()
                 end
             end)
+            -- Catch TSM/AH-replacement addons restoring the Blizzard AH frame
+            pcall(hooksecurefunc, ahFrame, "SetPoint", QueueAHRefresh)
+            pcall(hooksecurefunc, ahFrame, "SetScale", QueueAHRefresh)
+            pcall(hooksecurefunc, ahFrame, "SetAlpha", QueueAHRefresh)
         end
     end
 
@@ -863,7 +975,7 @@ local function SetupHooks()
 
     if PanelTemplates_TabResize then
         hooksecurefunc("PanelTemplates_TabResize", function(tab)
-            if not isApplying and IsSafeFrame(tab) and knownTabs[tab] then
+            if not isApplying and IsSafeFrame(tab) and not isOwnFrame[tab] and knownTabs[tab] then
                 isApplying = true
                 pcall(ApplyToTab, tab)
                 isApplying = false

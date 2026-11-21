@@ -2,7 +2,7 @@
 ## Title: AH Tab Resizer
 ## Notes: Resize and scale Blizzard and addon tabs at the bottom of the Auction House frame.
 ## Author: LittleLuckyPup
-## Version: 1.0
+## Version: @project-version@
 ## IconTexture: Interface\AddOns\AHTabResizer\icon.tga
 ## SavedVariables: AHTabResizerDB
 ## X-Curse-Project-ID: 1822133
