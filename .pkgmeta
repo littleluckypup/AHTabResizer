@@ -1,0 +1,6 @@
+package-as: AHTabResizer
+
+ignore:
+  - .gitignore
+  - .github
+  - README.md
